@@ -1,15 +1,18 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { startDaemon, stopDaemon, getDaemonStatus } from "./index.js";
+import { DaemonManager } from "./daemon/manager.js";
+import { readAllItems, readPendingItems, resetToPending, cleanupOldItems } from "./queue/index.js";
 import { logger } from "./utils/logger.js";
 
 const program = new Command();
+const daemonManager = new DaemonManager();
 
 program
-  .name("l-daemon")
-  .description("Claude Code session log watcher daemon with Linear integration")
+  .name("claude-linear-sync")
+  .description("Claude Code session to Linear sync daemon")
   .version("1.0.0");
 
+// Start command
 program
   .command("start")
   .description("Start the daemon")
@@ -18,11 +21,10 @@ program
     try {
       if (options.foreground) {
         logger.info("Starting daemon in foreground mode...");
-        await startDaemon({ foreground: true });
+        await daemonManager.startForeground();
       } else {
-        logger.info("Starting daemon...");
-        await startDaemon({ foreground: false });
-        logger.info("Daemon started successfully");
+        const pid = daemonManager.startBackground();
+        logger.info(`Daemon started (PID: ${pid})`);
       }
     } catch (error) {
       logger.error("Failed to start daemon:", error);
@@ -30,12 +32,13 @@ program
     }
   });
 
+// Stop command
 program
-  .command("end")
+  .command("stop")
   .description("Stop the daemon")
-  .action(async () => {
+  .action(() => {
     try {
-      const stopped = await stopDaemon();
+      const stopped = daemonManager.stop();
       if (stopped) {
         logger.info("Daemon stopped successfully");
       } else {
@@ -47,16 +50,15 @@ program
     }
   });
 
+// Status command
 program
   .command("status")
   .description("Check daemon status")
-  .action(async () => {
+  .action(() => {
     try {
-      const status = await getDaemonStatus();
+      const status = daemonManager.status();
       if (status.running) {
         logger.info(`Daemon is running (PID: ${status.pid})`);
-        logger.info(`Uptime: ${status.uptime}`);
-        logger.info(`Watching: ${status.watchedFiles} files`);
       } else {
         logger.info("Daemon is not running");
       }
@@ -64,6 +66,60 @@ program
       logger.error("Failed to get daemon status:", error);
       process.exit(1);
     }
+  });
+
+// Queue commands
+const queueCmd = program
+  .command("queue")
+  .description("Queue management commands");
+
+queueCmd
+  .command("list")
+  .description("List queue items")
+  .option("-a, --all", "Show all items (including processed)")
+  .action((options) => {
+    const items = options.all ? readAllItems() : readPendingItems();
+
+    if (items.length === 0) {
+      logger.info("Queue is empty");
+      return;
+    }
+
+    logger.info(`Found ${items.length} items:\n`);
+
+    for (const item of items) {
+      const time = new Date(item.timestamp).toLocaleString();
+      const status = item.status.toUpperCase();
+      console.log(`[${status}] ${item.id}`);
+      console.log(`  Type: ${item.type}`);
+      console.log(`  Time: ${time}`);
+      if (item.error) {
+        console.log(`  Error: ${item.error}`);
+      }
+      console.log("");
+    }
+  });
+
+queueCmd
+  .command("retry <id>")
+  .description("Retry a failed item")
+  .action((id) => {
+    try {
+      resetToPending(id);
+      logger.info(`Item ${id} reset to pending`);
+    } catch (error) {
+      logger.error(`Failed to retry item: ${error}`);
+    }
+  });
+
+queueCmd
+  .command("clear")
+  .description("Clear processed items")
+  .option("--hours <hours>", "Clear items older than N hours", "24")
+  .action((options) => {
+    const hours = parseInt(options.hours, 10);
+    const removed = cleanupOldItems(hours);
+    logger.info(`Removed ${removed} processed items`);
   });
 
 program.parse();

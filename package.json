@@ -1,10 +1,10 @@
 {
-  "name": "l-daemon",
+  "name": "claude-linear-sync",
   "version": "1.0.0",
-  "description": "Claude Code session log watcher daemon with Linear integration",
+  "description": "Claude Code session to Linear sync daemon using hooks",
   "type": "module",
   "bin": {
-    "l-daemon": "./dist/cli.js"
+    "claude-linear-sync": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsc",

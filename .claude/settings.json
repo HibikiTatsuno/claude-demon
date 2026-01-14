@@ -3,5 +3,26 @@
     "allow": [
       "Bash(curl *linear*)"
     ]
+  },
+  "hooks": {
+    "stop": [
+      {
+        "command": "npx tsx .claude/hooks/stop.ts",
+        "timeout": 5000
+      }
+    ],
+    "post_tool_use": [
+      {
+        "matcher": "Bash",
+        "command": "npx tsx .claude/hooks/post-tool-use.ts",
+        "timeout": 5000
+      }
+    ]
+  },
+  "mcpServers": {
+    "linear-server": {
+      "type": "sse",
+      "url": "https://mcp.linear.app/sse"
+    }
   }
 }

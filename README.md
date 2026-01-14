@@ -1,206 +1,237 @@
-# l-daemon
+# claude-linear-sync
 
-Claude Codeのセッションログを監視し、Linearのタスク管理と自動連携するデーモン。
+Claude CodeのHooks + Daemonのハイブリッド方式で、セッション内容をLinearに自動同期するツール。
 
-## 機能
+## 特徴
 
-- Claude Codeセッションログのリアルタイム監視
-- gitブランチ名からLinear Issue IDを自動抽出
-- セッションログをLinearのコメントとして追加
-- PRが作成されたらLinear Issueにリンクを追加
-- **自動Issue検出**: ブランチ名にIssue IDがなくても、セッション内容からLinear Issueを自動マッチング
-
-## 必要条件
-
-- Node.js 18以上
-- [Claude Code](https://claude.ai/claude-code)
-- Linear MCP (SSE接続)
-
-## インストール
-
-```bash
-cd ~/Desktop/claude-task-daemon
-npm install
-npm run build
-npm link
-```
-
-## 設定
-
-### 1. Linear MCPの設定
-
-`~/.claude.json`にLinear MCPサーバーを追加:
-
-```json
-{
-  "mcpServers": {
-    "linear-server": {
-      "type": "sse",
-      "url": "https://mcp.linear.app/sse"
-    }
-  }
-}
-```
-
-初回接続時にLinearの認証が求められます。Claude Codeで`/mcp`コマンドを実行して認証を完了してください。
-
-### 2. 設定ファイル (オプション)
-
-初回起動時に`~/.config/l-daemon/config.yaml`が自動生成されます:
-
-```yaml
-# Linear integration uses MCP (no API key required)
-
-watch:
-  claude_projects_path: ~/.claude/projects/
-
-branch_pattern: "([A-Z]+-\\d+)"
-
-logging:
-  level: info
-
-matching:
-  enabled: true
-  confidence_threshold: 0.7
-  keyword_weight: 0.6
-  semantic_weight: 0.4
-  enable_semantic: true
-  max_api_calls_per_minute: 30
-```
-
-## 使い方
-
-### デーモンの起動
-
-```bash
-l-daemon start
-```
-
-フォアグラウンドで実行する場合:
-
-```bash
-l-daemon start -f
-```
-
-### デーモンの停止
-
-```bash
-l-daemon stop
-```
-
-### ステータス確認
-
-```bash
-l-daemon status
-```
-
-## Issue検出の仕組み
-
-### 方法1: ブランチ名パターン
-
-ブランチ名にLinear Issue IDが含まれている場合、自動で検出:
-
-```
-feature/ENG-123-add-login    → ENG-123
-fix/PROJ-456-bug-fix         → PROJ-456
-chore/ABC-789-update-deps    → ABC-789
-```
-
-### 方法2: 自動マッチング (Fuzzy Matching)
-
-ブランチ名にIssue IDがない場合、セッション内容から自動でIssueを検出:
-
-1. **キーワード検索**: ユーザーリクエストからキーワードを抽出し、Linear MCP経由で検索
-2. **セマンティック検索**: `claude -p`を使用して候補Issueの関連性をAIで評価
-3. **信頼度判定**: スコアが閾値(デフォルト0.7)以上なら採用
-
-```
-セッション内容                    → Linear Issue検索
-────────────────────────────────────────────────────
-"認証バグを修正して"              → キーワード検索 (MCP経由)
-                                ↓
-候補Issue一覧                    → セマンティック検索 (claude -p)
-                                ↓
-信頼度スコア                     → 閾値以上なら採用
-```
+- **非ブロッキング**: Hookは軽量なキュー書き込みのみ（< 10ms）
+- **信頼性**: キューで永続化、失敗時リトライ可能
+- **Fuzzy Matching**: ブランチ名にIssue IDがなくても自動マッチング
+- **Linear GraphQL API**: シンプルなAPIキー認証でLinear連携
+- **自動Issue作成**: マッチするIssueがない場合は自動で新規作成
+- **自動Assign**: 指定ユーザーに自動アサイン
+- **自動Label**: ディレクトリパスから自動ラベル付け
 
 ## アーキテクチャ
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      l-daemon                               │
-│                                                             │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐ │
-│  │ File Watcher│───▶│ Log Parser  │───▶│ Issue Matcher   │ │
-│  │  (chokidar) │    │   (JSONL)   │    │ (Fuzzy Search)  │ │
-│  └─────────────┘    └─────────────┘    └────────┬────────┘ │
-│                                                  │          │
-└──────────────────────────────────────────────────┼──────────┘
-                                                   │
-                                         ┌─────────▼─────────┐
-                                         │    claude -p      │
-                                         │  (MCP経由でLinear)│
-                                         └─────────┬─────────┘
-                                                   │
-                                         ┌─────────▼─────────┐
-                                         │   Linear MCP      │
-                                         │ (mcp.linear.app)  │
-                                         └───────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                        Claude Code                               │
+│                                                                  │
+│  [stop hook] ──→ Queue Write (< 10ms, non-blocking)              │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Queue File (JSONL)                            │
+│           ~/.local/share/claude-linear-sync/queue.jsonl          │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ (chokidar watch)
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                         Daemon                                   │
+│                                                                  │
+│  1. Read transcript  ──→  Extract content                        │
+│  2. Find/Create issue ──→  Branch pattern / Auto-create          │
+│  3. Summarize        ──→  claude -p                              │
+│  4. Post to Linear   ──→  Linear GraphQL API                     │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## 設定オプション
+## セットアップ
 
-| 設定 | 説明 | デフォルト |
-|------|------|-----------|
-| `matching.enabled` | 自動マッチング機能を有効化 | `true` |
-| `matching.confidence_threshold` | マッチング採用の閾値 (0.0-1.0) | `0.7` |
-| `matching.keyword_weight` | キーワード検索の重み | `0.6` |
-| `matching.semantic_weight` | セマンティック検索の重み | `0.4` |
-| `matching.enable_semantic` | セマンティック検索を有効化 | `true` |
-| `matching.max_api_calls_per_minute` | API呼び出しレート制限 | `30` |
+### 1. Linear APIキーの取得
 
-## Claude Code Skill
-
-`/linear-issue`スキルでLinear Issueを検索できます。
-
-```
-/linear-issue ENG-123
-/linear-issue "search query"
-```
-
-## トラブルシューティング
-
-### デーモンが起動しない
+1. [Linear API Settings](https://linear.app/settings/api) にアクセス
+2. 「Create Key」で新しいAPIキーを作成
+3. 環境変数に設定:
 
 ```bash
-# PIDファイルを確認
-cat /tmp/l-daemon.pid
-
-# プロセスを強制終了
-kill $(cat /tmp/l-daemon.pid)
-rm /tmp/l-daemon.pid
+# ~/.bashrc or ~/.zshrc に追加
+export LINEAR_API_KEY=lin_api_xxxxxx
 ```
 
-### Linear MCPに接続できない
+### 2. Hooksの設定
 
-1. Claude Codeで`/mcp`を実行してMCP接続を確認
-2. `~/.claude.json`にLinear MCPの設定があるか確認
-3. Linear MCPの認証が完了しているか確認
+プロジェクトの`.claude/settings.json`:
 
-### セマンティック検索が動作しない
+```json
+{
+  "hooks": {
+    "stop": [
+      {
+        "command": "npx tsx .claude/hooks/stop.ts",
+        "timeout": 5000
+      }
+    ],
+    "post_tool_use": [
+      {
+        "matcher": "Bash",
+        "command": "npx tsx .claude/hooks/post-tool-use.ts",
+        "timeout": 5000
+      }
+    ]
+  }
+}
+```
 
-- `claude`コマンドが使用可能か確認: `claude --version`
-- Claude Codeにログインしているか確認: `claude`
-
-## 開発
+### 3. 依存関係のインストール
 
 ```bash
-# 開発モードで実行
-npm run dev start -f
-
-# ビルド
+npm install
 npm run build
 ```
+
+### 4. Daemon起動
+
+```bash
+# グローバルインストール
+npm link
+
+# Daemon起動
+claude-linear-sync start
+
+# ステータス確認
+claude-linear-sync status
+
+# Daemon停止
+claude-linear-sync stop
+```
+
+## CLI Commands
+
+```bash
+# Daemon管理
+claude-linear-sync start      # Daemon起動
+claude-linear-sync stop       # Daemon停止
+claude-linear-sync status     # ステータス確認
+
+# キュー管理
+claude-linear-sync queue list          # キュー一覧
+claude-linear-sync queue retry <id>    # リトライ
+claude-linear-sync queue clear         # クリア
+```
+
+## 処理フロー
+
+### Session Stop → Linear Sync
+
+```
+1. [Hook] Claude応答完了
+   └─→ キューに session_stop を追加 (< 10ms)
+
+2. [Daemon] バックグラウンド処理
+   ├─→ transcript読み込み
+   ├─→ ノイズ除去
+   ├─→ Issue検出/作成
+   │   ├─→ ブランチパターンマッチ
+   │   └─→ なければ新規Issue作成
+   ├─→ Issue設定
+   │   ├─→ Assignee設定 (hibiki.tatsuno)
+   │   ├─→ Status更新 (In Progress)
+   │   └─→ Label追加 (ディレクトリベース)
+   ├─→ 要約生成 (claude -p)
+   └─→ Linearにコメント (GraphQL API)
+```
+
+### PR Created → Linear Link
+
+```
+1. [Hook] gh pr create 検知
+   └─→ キューに pr_created を追加
+
+2. [Daemon] バックグラウンド処理
+   └─→ LinearにPRリンク追加
+```
+
+## Issue検出方法
+
+### 方法1: ブランチ名パターン
+
+```
+feature/ENG-123-add-login  → ENG-123
+fix/PROJ-456-bug-fix       → PROJ-456
+```
+
+### 方法2: Fuzzy Matching
+
+1. セッション内容からキーワード抽出
+2. Linear MCP経由で候補Issue検索
+3. LLM(`claude -p`)で関連性評価
+4. 信頼度 ≥ 0.7 で採用
+
+## 設定ファイル
+
+```yaml
+# ~/.config/claude-linear-sync/config.yaml
+
+queue:
+  path: ~/.local/share/claude-linear-sync/queue.jsonl
+  max_retries: 3
+
+linear:
+  api_key: ${LINEAR_API_KEY}     # 環境変数から取得
+  default_assignee: "hibiki.tatsuno"
+  branch_pattern: "([A-Z]+-\\d+)"
+
+labeling:
+  enabled: true
+  patterns:
+    frontend: [frontend, web, react, vue, next]
+    backend: [backend, api, server, node]
+    mobile: [mobile, ios, android, react-native]
+    infrastructure: [infra, devops, terraform, k8s]
+
+summarization:
+  enabled: true
+  max_length: 500
+
+logging:
+  level: info
+```
+
+## ディレクトリ構成
+
+```
+claude-linear-sync/
+├── .claude/
+│   ├── settings.json           # Hooks設定
+│   └── hooks/
+│       ├── stop.ts             # Session stop → Queue
+│       ├── post-tool-use.ts    # PR検知 → Queue
+│       └── lib/
+│           └── queue.ts        # Queue writer
+│
+├── src/
+│   ├── cli.ts                  # CLI commands
+│   ├── daemon/
+│   │   ├── processor.ts        # Queue processor
+│   │   └── manager.ts          # Daemon lifecycle
+│   ├── queue/
+│   │   └── types.ts            # Queue types
+│   ├── linear/
+│   │   └── client.ts           # Linear GraphQL API client
+│   ├── matching/
+│   │   └── ...                 # Issue matching
+│   └── transcript/
+│       └── ...                 # Transcript processing
+│
+└── package.json
+```
+
+## 方式比較
+
+| 観点 | Pure Hooks | Pure Daemon | Hybrid (本ツール) |
+|------|-----------|-------------|-------------------|
+| 遅延 | 高 | なし | なし |
+| 精度 | 高 | 中 | 高 |
+| 信頼性 | 低 | 中 | 高 |
+| リソース | オンデマンド | 常駐 | 常駐 |
+
+## 参考
+
+- [Claude Code Hooks](https://code.claude.com/docs/en/hooks)
+- [Zenn: Claude × Obsidian](https://zenn.dev/pepabo/articles/ffb79b5279f6ee)
 
 ## ライセンス
 

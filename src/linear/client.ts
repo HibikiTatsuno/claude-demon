@@ -1,174 +1,753 @@
-import { spawn } from "child_process";
-
 /**
  * Linear issue type
  */
 export interface LinearIssue {
-  id: string;
-  identifier: string;
-  title: string;
-  description?: string;
-  state: {
-    name: string;
-  };
-  assignee?: {
-    name: string;
-  };
-  url: string;
+	id: string;
+	identifier: string;
+	title: string;
+	description?: string;
+	state: {
+		id: string;
+		name: string;
+	};
+	assignee?: {
+		id: string;
+		name: string;
+	};
+	labels?: {
+		id: string;
+		name: string;
+	}[];
+	url: string;
 }
 
 /**
- * Client for Linear via MCP (using `claude -p` command)
+ * Linear label type
+ */
+export interface LinearLabel {
+	id: string;
+	name: string;
+}
+
+/**
+ * Linear team type
+ */
+export interface LinearTeam {
+	id: string;
+	name: string;
+	key: string;
+}
+
+/**
+ * Linear workflow state type
+ */
+export interface LinearWorkflowState {
+	id: string;
+	name: string;
+	type: string;
+}
+
+/**
+ * Linear user type
+ */
+export interface LinearUser {
+	id: string;
+	name: string;
+	email?: string;
+}
+
+/**
+ * Client for Linear GraphQL API
  */
 export class LinearClient {
-  private timeout: number;
+	private apiKey: string;
+	private baseUrl = "https://api.linear.app/graphql";
 
-  constructor(_apiKey?: string) {
-    // API key is no longer needed - using MCP via claude -p
-    this.timeout = 60000;
-  }
+	constructor(apiKey?: string) {
+		this.apiKey = apiKey || process.env.LINEAR_API_KEY || "";
+		if (!this.apiKey) {
+			console.warn(
+				"LINEAR_API_KEY not set. Please set it in environment variables.",
+			);
+		}
+	}
 
-  /**
-   * Executes a claude -p command and returns the response
-   */
-  private async executeClaudeCommand(prompt: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const child = spawn("claude", ["-p", prompt], {
-        stdio: ["pipe", "pipe", "pipe"],
-        timeout: this.timeout,
-      });
+	/**
+	 * Checks if the client is properly configured
+	 */
+	isConfigured(): boolean {
+		return !!this.apiKey;
+	}
 
-      let stdout = "";
-      let stderr = "";
+	/**
+	 * Executes a GraphQL query/mutation
+	 */
+	private async executeGraphQL<T>(
+		query: string,
+		variables?: Record<string, unknown>,
+	): Promise<T> {
+		if (!this.apiKey) {
+			throw new Error("LINEAR_API_KEY not configured");
+		}
 
-      child.stdout.on("data", (data) => {
-        stdout += data.toString();
-      });
+		const response = await fetch(this.baseUrl, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: this.apiKey,
+			},
+			body: JSON.stringify({ query, variables }),
+		});
 
-      child.stderr.on("data", (data) => {
-        stderr += data.toString();
-      });
+		if (!response.ok) {
+			throw new Error(
+				`Linear API error: ${response.status} ${response.statusText}`,
+			);
+		}
 
-      child.on("close", (code) => {
-        if (code === 0) {
-          resolve(stdout.trim());
-        } else {
-          reject(new Error(`claude -p failed with code ${code}: ${stderr}`));
+		const result = (await response.json()) as {
+			data?: T;
+			errors?: { message: string }[];
+		};
+
+		if (result.errors && result.errors.length > 0) {
+			throw new Error(`Linear GraphQL error: ${result.errors[0].message}`);
+		}
+
+		if (!result.data) {
+			throw new Error("No data returned from Linear API");
+		}
+
+		return result.data;
+	}
+
+	/**
+	 * Fetches an issue by identifier (e.g., ENG-123)
+	 */
+	async getIssue(identifier: string): Promise<LinearIssue | null> {
+		try {
+			const query = `
+        query GetIssue($identifier: String!) {
+          issue(id: $identifier) {
+            id
+            identifier
+            title
+            description
+            url
+            state {
+              id
+              name
+            }
+            assignee {
+              id
+              name
+            }
+            labels {
+              nodes {
+                id
+                name
+              }
+            }
+          }
         }
-      });
+      `;
 
-      child.on("error", (error) => {
-        reject(new Error(`Failed to spawn claude: ${error.message}`));
-      });
-    });
-  }
+			const data = await this.executeGraphQL<{
+				issue: {
+					id: string;
+					identifier: string;
+					title: string;
+					description?: string;
+					url: string;
+					state: { id: string; name: string };
+					assignee?: { id: string; name: string };
+					labels: { nodes: { id: string; name: string }[] };
+				};
+			}>(query, { identifier });
 
-  /**
-   * Parses JSON from claude response
-   */
-  private parseJsonFromResponse<T>(response: string): T | null {
-    try {
-      // Try to find JSON in the response
-      const jsonMatch = response.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]) as T;
-      }
+			if (!data.issue) return null;
 
-      // Try to find JSON array
-      const arrayMatch = response.match(/\[[\s\S]*\]/);
-      if (arrayMatch) {
-        return JSON.parse(arrayMatch[0]) as T;
-      }
+			return {
+				...data.issue,
+				labels: data.issue.labels?.nodes,
+			};
+		} catch (error) {
+			console.error("Failed to fetch issue:", error);
+			return null;
+		}
+	}
 
-      return null;
-    } catch {
-      return null;
-    }
-  }
+	/**
+	 * Searches for issues by query
+	 */
+	async searchIssues(searchQuery: string): Promise<LinearIssue[]> {
+		try {
+			const query = `
+        query SearchIssues($searchQuery: String!, $first: Int!) {
+          issueSearch(query: $searchQuery, first: $first) {
+            nodes {
+              id
+              identifier
+              title
+              description
+              url
+              state {
+                id
+                name
+              }
+              assignee {
+                id
+                name
+              }
+              labels {
+                nodes {
+                  id
+                  name
+                }
+              }
+            }
+          }
+        }
+      `;
 
-  /**
-   * Fetches an issue by identifier (e.g., ENG-123)
-   */
-  async getIssue(identifier: string): Promise<LinearIssue | null> {
-    try {
-      const prompt = `Use the Linear MCP to get issue ${identifier}. Return ONLY a JSON object with these fields: id, identifier, title, description, state (with name), assignee (with name), url. No explanation.`;
+			const data = await this.executeGraphQL<{
+				issueSearch: {
+					nodes: {
+						id: string;
+						identifier: string;
+						title: string;
+						description?: string;
+						url: string;
+						state: { id: string; name: string };
+						assignee?: { id: string; name: string };
+						labels: { nodes: { id: string; name: string }[] };
+					}[];
+				};
+			}>(query, { searchQuery, first: 10 });
 
-      const response = await this.executeClaudeCommand(prompt);
-      return this.parseJsonFromResponse<LinearIssue>(response);
-    } catch (error) {
-      console.error("Failed to fetch issue:", error);
-      return null;
-    }
-  }
+			return data.issueSearch.nodes.map((issue) => ({
+				...issue,
+				labels: issue.labels?.nodes,
+			}));
+		} catch (error) {
+			console.error("Failed to search issues:", error);
+			return [];
+		}
+	}
 
-  /**
-   * Searches for issues by query
-   */
-  async searchIssues(query: string): Promise<LinearIssue[]> {
-    try {
-      const prompt = `Use the Linear MCP to search for issues matching "${query}". Return ONLY a JSON array of issues with these fields for each: id, identifier, title, description, state (with name), assignee (with name), url. Limit to 10 results. No explanation.`;
+	/**
+	 * Fetches recent active issues for matching
+	 */
+	async getRecentIssues(limit: number = 20): Promise<LinearIssue[]> {
+		try {
+			const query = `
+        query GetRecentIssues($first: Int!) {
+          issues(
+            first: $first
+            orderBy: updatedAt
+            filter: {
+              state: { type: { in: ["started", "unstarted"] } }
+            }
+          ) {
+            nodes {
+              id
+              identifier
+              title
+              description
+              url
+              state {
+                id
+                name
+              }
+              assignee {
+                id
+                name
+              }
+              labels {
+                nodes {
+                  id
+                  name
+                }
+              }
+            }
+          }
+        }
+      `;
 
-      const response = await this.executeClaudeCommand(prompt);
-      const issues = this.parseJsonFromResponse<LinearIssue[]>(response);
-      return issues || [];
-    } catch (error) {
-      console.error("Failed to search issues:", error);
-      return [];
-    }
-  }
+			const data = await this.executeGraphQL<{
+				issues: {
+					nodes: {
+						id: string;
+						identifier: string;
+						title: string;
+						description?: string;
+						url: string;
+						state: { id: string; name: string };
+						assignee?: { id: string; name: string };
+						labels: { nodes: { id: string; name: string }[] };
+					}[];
+				};
+			}>(query, { first: limit });
 
-  /**
-   * Fetches recent active issues for matching
-   */
-  async getRecentIssues(limit: number = 20): Promise<LinearIssue[]> {
-    try {
-      const prompt = `Use the Linear MCP to list recent active issues (in progress or todo status). Return ONLY a JSON array of up to ${limit} issues with these fields for each: id, identifier, title, description, state (with name), assignee (with name), url. No explanation.`;
+			return data.issues.nodes.map((issue) => ({
+				...issue,
+				labels: issue.labels?.nodes,
+			}));
+		} catch (error) {
+			console.error("Failed to fetch recent issues:", error);
+			return [];
+		}
+	}
 
-      const response = await this.executeClaudeCommand(prompt);
-      const issues = this.parseJsonFromResponse<LinearIssue[]>(response);
-      return issues || [];
-    } catch (error) {
-      console.error("Failed to fetch recent issues:", error);
-      return [];
-    }
-  }
+	/**
+	 * Adds a comment to an issue
+	 */
+	async addComment(issueId: string, body: string): Promise<boolean> {
+		try {
+			const mutation = `
+        mutation AddComment($issueId: String!, $body: String!) {
+          commentCreate(input: { issueId: $issueId, body: $body }) {
+            success
+          }
+        }
+      `;
 
-  /**
-   * Adds a comment to an issue
-   */
-  async addComment(issueIdentifier: string, body: string): Promise<boolean> {
-    try {
-      // Escape quotes in body for the prompt
-      const escapedBody = body.replace(/"/g, '\\"').replace(/\n/g, "\\n");
+			const data = await this.executeGraphQL<{
+				commentCreate: { success: boolean };
+			}>(mutation, { issueId, body });
 
-      const prompt = `Use the Linear MCP to add a comment to issue ${issueIdentifier}. The comment body is: "${escapedBody}". Return ONLY {"success": true} or {"success": false}. No explanation.`;
+			return data.commentCreate.success;
+		} catch (error) {
+			console.error("Failed to add comment:", error);
+			return false;
+		}
+	}
 
-      const response = await this.executeClaudeCommand(prompt);
-      const result = this.parseJsonFromResponse<{ success: boolean }>(response);
-      return result?.success ?? false;
-    } catch (error) {
-      console.error("Failed to add comment:", error);
-      return false;
-    }
-  }
+	/**
+	 * Attaches a link to an issue (e.g., PR URL)
+	 */
+	async attachLink(
+		issueId: string,
+		url: string,
+		title: string,
+	): Promise<boolean> {
+		try {
+			const mutation = `
+        mutation AttachLink($issueId: String!, $url: String!, $title: String!) {
+          attachmentCreate(input: { issueId: $issueId, url: $url, title: $title }) {
+            success
+          }
+        }
+      `;
 
-  /**
-   * Attaches a link to an issue (e.g., PR URL)
-   */
-  async attachLink(
-    issueIdentifier: string,
-    url: string,
-    title: string
-  ): Promise<boolean> {
-    try {
-      const prompt = `Use the Linear MCP to add a link attachment to issue ${issueIdentifier}. URL: "${url}", Title: "${title}". Return ONLY {"success": true} or {"success": false}. No explanation.`;
+			const data = await this.executeGraphQL<{
+				attachmentCreate: { success: boolean };
+			}>(mutation, { issueId, url, title });
 
-      const response = await this.executeClaudeCommand(prompt);
-      const result = this.parseJsonFromResponse<{ success: boolean }>(response);
-      return result?.success ?? false;
-    } catch (error) {
-      console.error("Failed to attach link:", error);
-      return false;
-    }
-  }
+			return data.attachmentCreate.success;
+		} catch (error) {
+			console.error("Failed to attach link:", error);
+			return false;
+		}
+	}
+
+	/**
+	 * Creates a new issue
+	 */
+	async createIssue(params: {
+		title: string;
+		description?: string;
+		teamId: string;
+		assigneeId?: string;
+		labelIds?: string[];
+		stateId?: string;
+	}): Promise<LinearIssue | null> {
+		try {
+			const mutation = `
+        mutation CreateIssue($input: IssueCreateInput!) {
+          issueCreate(input: $input) {
+            success
+            issue {
+              id
+              identifier
+              title
+              url
+              state {
+                id
+                name
+              }
+            }
+          }
+        }
+      `;
+
+			const input: Record<string, unknown> = {
+				title: params.title,
+				teamId: params.teamId,
+			};
+
+			if (params.description) input.description = params.description;
+			if (params.assigneeId) input.assigneeId = params.assigneeId;
+			if (params.labelIds && params.labelIds.length > 0)
+				input.labelIds = params.labelIds;
+			if (params.stateId) input.stateId = params.stateId;
+
+			const data = await this.executeGraphQL<{
+				issueCreate: {
+					success: boolean;
+					issue: {
+						id: string;
+						identifier: string;
+						title: string;
+						url: string;
+						state: { id: string; name: string };
+					};
+				};
+			}>(mutation, { input });
+
+			if (!data.issueCreate.success) return null;
+
+			return {
+				...data.issueCreate.issue,
+				labels: [],
+			};
+		} catch (error) {
+			console.error("Failed to create issue:", error);
+			return null;
+		}
+	}
+
+	/**
+	 * Updates issue status
+	 */
+	async updateIssueStatus(issueId: string, stateId: string): Promise<boolean> {
+		try {
+			const mutation = `
+        mutation UpdateIssue($issueId: String!, $stateId: String!) {
+          issueUpdate(id: $issueId, input: { stateId: $stateId }) {
+            success
+          }
+        }
+      `;
+
+			const data = await this.executeGraphQL<{
+				issueUpdate: { success: boolean };
+			}>(mutation, { issueId, stateId });
+
+			return data.issueUpdate.success;
+		} catch (error) {
+			console.error("Failed to update issue status:", error);
+			return false;
+		}
+	}
+
+	/**
+	 * Assigns issue to a user
+	 */
+	async assignIssue(issueId: string, assigneeId: string): Promise<boolean> {
+		try {
+			const mutation = `
+        mutation AssignIssue($issueId: String!, $assigneeId: String!) {
+          issueUpdate(id: $issueId, input: { assigneeId: $assigneeId }) {
+            success
+          }
+        }
+      `;
+
+			const data = await this.executeGraphQL<{
+				issueUpdate: { success: boolean };
+			}>(mutation, { issueId, assigneeId });
+
+			return data.issueUpdate.success;
+		} catch (error) {
+			console.error("Failed to assign issue:", error);
+			return false;
+		}
+	}
+
+	/**
+	 * Adds labels to an issue
+	 */
+	async addLabels(issueId: string, labelIds: string[]): Promise<boolean> {
+		try {
+			// 既存のラベルを取得してマージする
+			const issue = await this.getIssueById(issueId);
+			if (!issue) return false;
+
+			const existingLabelIds = issue.labels?.map((l) => l.id) || [];
+			const allLabelIds = [...new Set([...existingLabelIds, ...labelIds])];
+
+			const mutation = `
+        mutation UpdateIssueLabels($issueId: String!, $labelIds: [String!]!) {
+          issueUpdate(id: $issueId, input: { labelIds: $labelIds }) {
+            success
+          }
+        }
+      `;
+
+			const data = await this.executeGraphQL<{
+				issueUpdate: { success: boolean };
+			}>(mutation, { issueId, labelIds: allLabelIds });
+
+			return data.issueUpdate.success;
+		} catch (error) {
+			console.error("Failed to add labels:", error);
+			return false;
+		}
+	}
+
+	/**
+	 * Gets an issue by ID (internal use)
+	 */
+	private async getIssueById(issueId: string): Promise<LinearIssue | null> {
+		try {
+			const query = `
+        query GetIssueById($issueId: String!) {
+          issue(id: $issueId) {
+            id
+            identifier
+            title
+            description
+            url
+            state {
+              id
+              name
+            }
+            assignee {
+              id
+              name
+            }
+            labels {
+              nodes {
+                id
+                name
+              }
+            }
+          }
+        }
+      `;
+
+			const data = await this.executeGraphQL<{
+				issue: {
+					id: string;
+					identifier: string;
+					title: string;
+					description?: string;
+					url: string;
+					state: { id: string; name: string };
+					assignee?: { id: string; name: string };
+					labels: { nodes: { id: string; name: string }[] };
+				};
+			}>(query, { issueId });
+
+			if (!data.issue) return null;
+
+			return {
+				...data.issue,
+				labels: data.issue.labels?.nodes,
+			};
+		} catch (error) {
+			console.error("Failed to fetch issue by ID:", error);
+			return null;
+		}
+	}
+
+	/**
+	 * Gets available labels for a team
+	 */
+	async getLabels(teamId?: string): Promise<LinearLabel[]> {
+		try {
+			let query: string;
+			let variables: Record<string, unknown>;
+
+			if (teamId) {
+				query = `
+          query GetTeamLabels($teamId: String!) {
+            team(id: $teamId) {
+              labels {
+                nodes {
+                  id
+                  name
+                }
+              }
+            }
+          }
+        `;
+				variables = { teamId };
+
+				const data = await this.executeGraphQL<{
+					team: { labels: { nodes: { id: string; name: string }[] } };
+				}>(query, variables);
+
+				return data.team.labels.nodes;
+			} else {
+				query = `
+          query GetAllLabels {
+            issueLabels(first: 100) {
+              nodes {
+                id
+                name
+              }
+            }
+          }
+        `;
+
+				const data = await this.executeGraphQL<{
+					issueLabels: { nodes: { id: string; name: string }[] };
+				}>(query);
+
+				return data.issueLabels.nodes;
+			}
+		} catch (error) {
+			console.error("Failed to get labels:", error);
+			return [];
+		}
+	}
+
+	/**
+	 * Gets workflow states for a team
+	 */
+	async getWorkflowStates(teamId?: string): Promise<LinearWorkflowState[]> {
+		try {
+			let query: string;
+			let variables: Record<string, unknown>;
+
+			if (teamId) {
+				query = `
+          query GetTeamStates($teamId: String!) {
+            team(id: $teamId) {
+              states {
+                nodes {
+                  id
+                  name
+                  type
+                }
+              }
+            }
+          }
+        `;
+				variables = { teamId };
+
+				const data = await this.executeGraphQL<{
+					team: {
+						states: { nodes: { id: string; name: string; type: string }[] };
+					};
+				}>(query, variables);
+
+				return data.team.states.nodes;
+			} else {
+				query = `
+          query GetAllStates {
+            workflowStates(first: 100) {
+              nodes {
+                id
+                name
+                type
+              }
+            }
+          }
+        `;
+
+				const data = await this.executeGraphQL<{
+					workflowStates: {
+						nodes: { id: string; name: string; type: string }[];
+					};
+				}>(query);
+
+				return data.workflowStates.nodes;
+			}
+		} catch (error) {
+			console.error("Failed to get workflow states:", error);
+			return [];
+		}
+	}
+
+	/**
+	 * Gets teams
+	 */
+	async getTeams(): Promise<LinearTeam[]> {
+		try {
+			const query = `
+        query GetTeams {
+          teams {
+            nodes {
+              id
+              name
+              key
+            }
+          }
+        }
+      `;
+
+			const data = await this.executeGraphQL<{
+				teams: { nodes: { id: string; name: string; key: string }[] };
+			}>(query);
+
+			return data.teams.nodes;
+		} catch (error) {
+			console.error("Failed to get teams:", error);
+			return [];
+		}
+	}
+
+	/**
+	 * Finds user by name or email
+	 */
+	async findUser(nameOrEmail: string): Promise<LinearUser | null> {
+		try {
+			const query = `
+        query FindUser {
+          users(first: 50) {
+            nodes {
+              id
+              name
+              email
+            }
+          }
+        }
+      `;
+
+			const data = await this.executeGraphQL<{
+				users: { nodes: { id: string; name: string; email?: string }[] };
+			}>(query);
+
+			// nameOrEmailで部分一致検索
+			const user = data.users.nodes.find(
+				(u) =>
+					u.name.toLowerCase().includes(nameOrEmail.toLowerCase()) ||
+					u.email?.toLowerCase().includes(nameOrEmail.toLowerCase()),
+			);
+
+			return user || null;
+		} catch (error) {
+			console.error("Failed to find user:", error);
+			return null;
+		}
+	}
+
+	/**
+	 * Gets the current authenticated user
+	 */
+	async getViewer(): Promise<LinearUser | null> {
+		try {
+			const query = `
+        query GetViewer {
+          viewer {
+            id
+            name
+            email
+          }
+        }
+      `;
+
+			const data = await this.executeGraphQL<{
+				viewer: { id: string; name: string; email?: string };
+			}>(query);
+
+			return data.viewer;
+		} catch (error) {
+			console.error("Failed to get viewer:", error);
+			return null;
+		}
+	}
 }

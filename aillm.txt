@@ -1,0 +1,72 @@
+# Claude Task Daemon
+
+Claude CodeセッションをLinearに自動同期するHybrid Hook + Daemonツール。
+
+## 概要
+
+このプロジェクトは、Claude Codeでの作業内容を自動的にLinearのIssueに同期します。
+
+- **Hooks**: Claude Codeの`stop`イベントで軽量なキュー書き込み（<10ms）
+- **Daemon**: バックグラウンドでキューを処理し、Linear APIに同期
+
+## 主要機能
+
+1. **自動Issue作成**: マッチするIssueがない場合、セッション内容から自動作成
+2. **Status追従**: 作業中は"In Progress"、PR作成時は"In Review"に自動更新
+3. **自動Assign**: 指定ユーザー（hibiki.tatsuno）に自動アサイン
+4. **自動Label**: ディレクトリパスから適切なラベルを自動付与
+
+## アーキテクチャ
+
+```
+[Claude Code] → [Hook] → [Queue (JSONL)] → [Daemon] → [Linear GraphQL API]
+```
+
+### Hook層（軽量・非ブロッキング）
+- `.claude/hooks/stop.ts`: セッション終了時にキューに書き込み
+- `.claude/hooks/post-tool-use.ts`: PR作成検知
+
+### Queue層（永続化）
+- `~/.local/share/claude-linear-sync/queue.jsonl`
+- 失敗時リトライ対応
+
+### Daemon層（バックグラウンド処理）
+- `src/daemon/processor.ts`: キュー処理、Linear API呼び出し
+- `src/daemon/manager.ts`: Daemonライフサイクル管理
+
+### Linear連携層
+- `src/linear/client.ts`: Linear GraphQL APIクライアント
+- 環境変数`LINEAR_API_KEY`で認証
+
+## ディレクトリ構成
+
+```
+claude-task-daemon/
+├── .claude/
+│   ├── settings.json        # Hooks設定
+│   └── hooks/               # Hook実装
+├── src/
+│   ├── cli.ts               # CLIコマンド
+│   ├── daemon/              # Daemon実装
+│   ├── queue/               # キュー管理
+│   ├── linear/              # Linear APIクライアント
+│   ├── matching/            # Issue マッチング
+│   └── transcript/          # セッション解析
+├── test-linear.ts           # Linear APIテスト
+└── package.json
+```
+
+## セットアップ
+
+1. Linear APIキーを取得: https://linear.app/settings/api
+2. 環境変数設定: `export LINEAR_API_KEY=lin_api_xxx`
+3. 依存関係インストール: `npm install`
+4. Daemon起動: `npx tsx src/cli.ts start`
+
+## 技術スタック
+
+- TypeScript
+- Node.js
+- Linear GraphQL API
+- chokidar (ファイル監視)
+- Commander.js (CLI)
